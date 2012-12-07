@@ -10,11 +10,11 @@ use Carp 'croak';
 use constant STAT_NLINKS => 3;
 use constant DEBUG => 0;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 =head1 NAME
 
-File::SharedNFSLock - Inter-machine locking on NFS volumes
+File::SharedNFSLock - Inter-machine advisory file locking on NFS volumes
 
 =head1 SYNOPSIS
 
@@ -37,13 +37,15 @@ File::SharedNFSLock - Inter-machine locking on NFS volumes
 
 =head1 DESCRIPTION
 
-NFS (at least before v4) is evil. File locking on NFS volumes is worse.
-This module attempts to implement file locking on NFS volumes using lock
-files and hard links. It's in production use at our site, but if it doesn't work
-for you, I'm not surprised!
+This module implements advisory file locking on NFS (or non-NFS) filesystems.
 
-Note that the lock files are always written to the same directory as the original file!
-There is always one lock file per process that tries to acquire the lock.
+NFS (at least before v4) is evil. File locking on NFS volumes is worse. This
+module attempts to implement file locking on NFS volumes using lock files and
+hard links. It's in production use at our site, but if it doesn't work for you,
+I'm not surprised!
+
+Note that the lock files are always written to the same directory as the original
+file! There is always one lock file per process that tries to acquire the lock.
 This module does B<NOT> do signal handling. You will have to do that yourself.
 
 =head2 ALGORITHM
@@ -57,7 +59,7 @@ have acquired the lock.
 The algorithm was snatched from a document called I<NFS Considered Harmful> by
 I<Shane Kerr>. I found it at L<http://www.time-travellers.org/shane/papers/NFS_considered_harmful.html>.
 Look for chapter III, I<List of Concerns>, concern I<d>: I<Exclusive File Creation>.
-The described workaround is, I quote the above:
+The described workaround is, I quote:
 
   The solution for performing atomic file locking using a lockfile
   is to create a unique file on the same fs (e.g., incorporating
@@ -95,7 +97,7 @@ Default: 5 minutes. Set this to 0 to disable the feature.
 I<unique_token> is an optional parameter that will uniquely identify
 the lock. If you want to attempt locking the same file from
 the same process in different locations, they must set
-a unique token (process id and hostname are used additionally).
+a unique token (host name, process id and thread id are used additionally).
 Set this to C<1> to have a random token auto-generated.
 
 =cut
@@ -128,8 +130,9 @@ SCOPE: {
     } => $class;
     if (DEBUG) {
       warn "New lock for file '$self->{file}' (not acquired yet).\n"
-           ."Time out for acquisition: $self->{timeout_acquire}\n"
-           ."Time out for stale locks: $self->{timeout_stale}";
+          ."Time out for acquisition: $self->{timeout_acquire}\n"
+          ."Time out for stale locks: $self->{timeout_stale}\n"
+          ."Poll interval           : $self->{poll_interval}\n";
     }
     return $self;
   }
@@ -144,27 +147,25 @@ Returns 1 on success, 0 on failure (time out).
 
 sub lock {
   my $self = shift;
-  warn "Getting lock on " . $self->{file} if DEBUG;
+  warn "Getting lock on ".$self->{file}."\n" if DEBUG;
 
-  return if $self->locked;
-  warn "It's not locked already... " . $self->{file} if DEBUG;
+  return 1 if $self->got_lock;
+  warn "It is not locked already... ".$self->{file}."\n" if DEBUG;
 
   my $before_time = Time::HiRes::time();
+  warn "Before time is $before_time\n" if DEBUG;
   while (1) {
-    my $got_lock = $self->_write_lock_file();
-    if ($got_lock) {
+    if ($self->_write_lock_file()) {
       return 1;
-    }
-    else {
+    } else {
       # check whether lock is stale
-      my $stale = $self->_is_stale_lock;
-      if ($stale) {
-        unlink($self->_lock_file);
-        unlink($self->_unique_lock_file);
-      }
-      else {
+      if ($self->_is_stale_lock) {
+        unlink $self->_lock_file;
+        unlink $self->_unique_lock_file;
+      } else {
         # hmm. lock valid, wait a bit or bail out
         my $now = Time::HiRes::time();
+        warn "Time now is $now\n" if DEBUG;
         if ($now-$before_time > $self->{timeout_acquire}) {
           $self->_unlink_lock_file;
           return 0;
@@ -189,26 +190,54 @@ sub unlock {
   $self->_unlink_lock_file;
 }
 
-=head2 locked
+=head2 got_lock
 
-Checks whether we have the lock on the file.
+Checks whether we have the lock on the file. Prefer calling got_lock() instead
+of its older form, locked().
 
-I<Note:> Fairly expensive operation requiring a C<stat> call.
+I<Note:> This is a fairly expensive operation requiring a C<stat> call.
 
 =cut
 
-sub locked {
+sub got_lock {
   my $self = shift;
-  # check whether somebody else timed out the lock
-  my @stat = stat($self->_unique_lock_file);
-  if (defined($stat[STAT_NLINKS]) and $stat[STAT_NLINKS] == 2) {
-    warn "locked: LOCKED with " . $self->_unique_lock_file if DEBUG;
+  # Check whether somebody else timed out the lock
+  my $nlinks = ( stat($self->_unique_lock_file) )[STAT_NLINKS];
+  if ( (defined $nlinks) and ($nlinks == 2) ) {
+    warn "got_lock: LOCKED with ".$self->_unique_lock_file."\n" if DEBUG;
     return 1;
-  }
-  else {
-    warn "locked: NOT LOCKED with " . $self->_unique_lock_file if DEBUG;
+  } else {
+    warn "got_lock: NOT LOCKED with ".$self->_unique_lock_file."\n" if DEBUG;
     return 0;
   }
+}
+*locked = \&got_lock;
+
+=head2 is_locked
+
+Checks file is currently locked by someone.
+
+=cut
+
+sub is_locked {
+  # Simply check for presence of lock_file
+  return (-f shift->_lock_file) ? 1 : 0;
+}
+
+
+=head2 wait
+
+Wait until the file becomes free of any lock. This uses the I<poll_interval>
+constructor passed to new().
+
+=cut
+
+sub wait {
+  my $self = shift;
+  while ( $self->is_locked ) {
+    Time::HiRes::sleep($self->{poll_interval}) if $self->{poll_interval};
+  }
+  return 1;
 }
 
 sub DESTROY {
@@ -218,11 +247,11 @@ sub DESTROY {
 
 sub _unlink_lock_file {
   my $self = shift;
-  if ($self->locked) {
-    warn "_unlink_lock_file: locked, removing main lock file" if DEBUG;
+  if ($self->got_lock) {
+    warn "_unlink_lock_file: locked, removing main lock file\n" if DEBUG;
     unlink($self->_lock_file);
   }
-  warn "_unlink_lock_file: removing unique lock file" if DEBUG;
+  warn "_unlink_lock_file: removing unique lock file\n" if DEBUG;
   unlink($self->_unique_lock_file);
 }
 
@@ -231,26 +260,28 @@ sub _write_lock_file {
   my $unique_lock_file = $self->_unique_lock_file;
   unlink($unique_lock_file) if -e $unique_lock_file;
 
+  # Create process-specific lock file
   open my $fh, '>', $unique_lock_file
     or die "Could not open unique lock file for writing: $!";
   print $fh Time::HiRes::time(), "\012", $unique_lock_file, "\012";
   close $fh;
 
-  my $lock_file = $self->_lock_file;
-  link($unique_lock_file, $lock_file);
-  my @stat = stat($unique_lock_file);
-  if ($stat[STAT_NLINKS] == 2) {
-    warn "_write_lock_file: HAVE LOCK!" if DEBUG;
-    return 1;
+  # Attempt locking via linking
+  my $linked = link($unique_lock_file, $self->_lock_file);
+  if ( (not $linked) && ($! =~ m/not permitted/i) ) {
+    die "Error: The filesystem that holds file ".$self->{file}." does not ".
+      "support link().\n";
   }
-  return 0;
+
+  return $self->got_lock
 }
 
 sub _unique_lock_file {
   my $self = shift;
   return $self->{unique_lock_file} if defined $self->{unique_lock_file};
-  my $lock_file = $self->_lock_file;
-  my $unique_lock_file = "$lock_file." . $self->{hostname} . ".$$." . $self->{token};
+  my $thread_id = exists $INC{'threads.pm'} ? threads->tid : '';
+  my $unique_lock_file = join( '.',
+    $self->_lock_file, $self->{hostname}, $$, $thread_id, $self->{token});
   $self->{unique_lock_file} = $unique_lock_file;
   return $self->{unique_lock_file};
 }
@@ -258,9 +289,8 @@ sub _unique_lock_file {
 sub _lock_file {
   my $self = shift;
   return $self->{lock_file} if defined $self->{lock_file};
-  my $orig_filename = $self->{file};
-  my ($volume, $path, $lock_file) = File::Spec->splitpath($orig_filename);
-  $lock_file .= ".lock";
+  my ($volume, $path, $lock_file) = File::Spec->splitpath( $self->{file} );
+  $lock_file .= '.lock';
   $lock_file = File::Spec->catpath($volume, $path, $lock_file);
   $self->{lock_file} = $lock_file;
   return $lock_file;
@@ -287,21 +317,29 @@ __END__
 
 =head1 CAVEATS
 
-This isn't as well tested as it should be even though it is being used
-in production here. Do your own testing.
+=head2 Lack of link() support
 
-There are no unit tests! (Patches welcome!)
+Some filesystems such as FAT32 do not support linking files. If the file you
+want to lock is on such a filesystem, you will receive an error message.
+
+Note: FAT32 is mostly relegated to USB sticks nowadays. No sane server will use
+NFS-mounted FAT32 filesystems.
+
+=head2 Testing
+
+Basic unit tests are in place for this module. However, it is not extensively
+tested (Patches welcome!). While the module is used on production systems here,
+do your own testing since it may contain hidden race conditions.
 
 Born out of frustration with existing locking modules.
 
-Probably contains hidden race conditions.
-
 =head1 SEE ALSO
 
-L<File::NFSLock>, but that doesn't work for multiple machines (just for a single machine
-and multiple processes).
+L<File::NFSLock>, but that doesn't work for multiple machines (just for a single
+machine and multiple processes).
 
-L<Time::HiRes> is used to implement fractional-second C<sleep()> and C<time()> calls.
+L<Time::HiRes> is used to implement fractional-second C<sleep()> and C<time()>
+calls.
 
 =head1 AUTHOR
 
